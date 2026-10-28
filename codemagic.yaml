@@ -3,30 +3,184 @@ workflows:
     name: Verify nxnative Build Environment
     instance_type: mac_mini_m2
     max_build_duration: 30
-
     environment:
       xcode: 27.1
-
     scripts:
       - name: Verify build tools
         script: |
           set -eu
-          echo "Checking Apple Silicon..."
           uname -m
-
-          echo "Checking macOS..."
           sw_vers
-
-          echo "Checking Xcode..."
           xcodebuild -version
-
-          echo "Checking Python..."
           python3 --version
-
-          echo "Checking Homebrew..."
           brew --version
-
-          echo "Checking nxnative..."
           test -f scripts/build_ipa_from_nsp.py
 
-          echo "Environment check completed!"
+  great-ace-attorney:
+    name: Great Ace Attorney - private unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 27.1
+      groups:
+        - nxnative_private
+    # Manual launch only. Do not add webhook, PR, scheduled or tag triggers.
+    scripts:
+      - name: Build and encrypt private output
+        script: |
+          set +x
+          set -eu
+          python3 - <<'PRIVATE_BUILD_PY'
+          """Manual Codemagic build. No keys, input URLs, or raw build logs on stdout."""
+          import base64
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import urllib.parse
+          import urllib.request
+
+          REV = "2f1a0442249acb4b89da9efc9edc27b4ac617348"
+          TITLE = "010036E00FB20000"
+          SECRET_NAMES = ("GAME_URL", "GAME_SHA256", "PROD_KEYS_B64")
+
+
+          class SafeError(Exception):
+              pass
+
+
+          def require(condition, message):
+              if not condition:
+                  raise SafeError(message)
+
+
+          class HTTPSOnly(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  require(urllib.parse.urlsplit(newurl).scheme == "https", "Non-HTTPS redirect rejected.")
+                  return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+          def download(url, target, expected):
+              parts = urllib.parse.urlsplit(url)
+              require(parts.scheme == "https" and parts.hostname and not parts.username,
+                      "GAME_URL must be an HTTPS private download URL without a username.")
+              require(re.fullmatch(r"[0-9a-fA-F]{64}", expected), "GAME_SHA256 must be a SHA-256 digest.")
+              digest = hashlib.sha256()
+              try:
+                  with urllib.request.build_opener(HTTPSOnly()).open(url, timeout=120) as src, target.open("wb") as dst:
+                      while block := src.read(8 * 1024 * 1024):
+                          digest.update(block)
+                          dst.write(block)
+              except Exception:
+                  raise SafeError("Private download failed; check its expiry and access permissions.") from None
+              require(digest.hexdigest() == expected.lower(), "Game checksum mismatch; build stopped.")
+
+
+          def run(cmd, log, env, cwd=None):
+              result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=cwd)
+              require(result.returncode == 0, "A build step failed; inspect encrypted diagnostics.")
+
+
+          def main():
+              os.umask(0o077)
+              require(sys.platform == "darwin" and os.uname().machine == "arm64", "Apple Silicon macOS is required.")
+              require(os.environ.get("CM_BRANCH") == "main", "Launch the reviewed main branch only.")
+              require(os.environ.get("CM_PULL_REQUEST", "").lower() in ("", "false", "0"), "Pull request builds are disabled.")
+              for name in SECRET_NAMES + ("IPA_AGE_RECIPIENT",):
+                  require(bool(os.environ.get(name)), f"Missing Codemagic variable: {name}.")
+              recipient = os.environ["IPA_AGE_RECIPIENT"].strip()
+              require(re.fullmatch(r"age1[0-9a-z]+", recipient), "Use an age public recipient (age1...).")
+              url, sha, key_b64 = (os.environ.pop(name) for name in SECRET_NAMES)
+              env = dict(os.environ)
+              env.pop("SPIRV_CROSS", None)  # use the repository's locked compiler
+              env.pop("DOTNET_ROOT", None)
+              artifacts = Path(os.environ["CM_BUILD_DIR"]) / "private-artifacts"
+              # Never mix a previous run's output with a new run.
+              require(not artifacts.exists(), "private-artifacts already exists; use a fresh build machine.")
+              artifacts.mkdir(mode=0o700)
+              with tempfile.TemporaryDirectory(prefix="nxnative-private-") as tmp:
+                  root = Path(tmp)
+                  source, game = root / "source", root / "game"
+                  game.mkdir()
+                  log_path = root / "diagnostics.log"
+                  ready_age = False
+                  try:
+                      with log_path.open("wb") as log:
+                          print("Preparing pinned source and build tools...", flush=True)
+                          source.mkdir()
+                          run(["git", "init", "-q", str(source)], log, env)
+                          run(["git", "fetch", "--depth", "1", "https://github.com/seedds/nxnative.git", REV], log, env, source)
+                          run(["git", "checkout", "--detach", "FETCH_HEAD"], log, env, source)
+                          actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, env=env, text=True).strip()
+                          require(actual == REV, "Source revision mismatch.")
+                          run(["brew", "install", "xcodegen", "zstd", "glslang", "age"], log, env)
+                          ready_age = True
+                          # Validate the public recipient before downloading any private input.
+                          probe = root / "probe"
+                          probe.write_bytes(b"recipient validation")
+                          run(["age", "-r", recipient, "-o", str(root / "probe.age"), str(probe)], log, env)
+                          runtimes = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True, env=env) if shutil.which("dotnet") else None
+                          if not runtimes or "Microsoft.NETCore.App 10." not in runtimes.stdout:
+                              run(["brew", "install", "--cask", "dotnet-sdk"], log, env)
+                          runtimes = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True, env=env)
+                          require(runtimes.returncode == 0 and "Microsoft.NETCore.App 10." in runtimes.stdout,
+                                  "The bundled translator requires .NET 10; install its arm64 runtime on the build image.")
+                          run(["xcodebuild", "-downloadComponent", "MetalToolchain"], log, env)
+                          run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], log, env)
+                          run([sys.executable, "-m", "venv", str(root / "venv")], log, env)
+                          py = str(root / "venv/bin/python")
+                          env["PATH"] = str(root / "venv/bin") + os.pathsep + env["PATH"]
+                          run([py, "-m", "pip", "install", "lz4", "capstone", "fonttools", "nsz", "backports.zstd; python_version < '3.14'"], log, env)
+                          run([py, str(source / "dm/gfx/tools/own_compilers.py"), "--check-metal"], log, env, source)
+                          require(shutil.disk_usage(root).free > 30 * 1024**3, "At least 30 GiB free disk is required for this workflow.")
+                          print("Downloading private base NSP and checking its checksum...", flush=True)
+                          download(url, game / f"{TITLE}[v0].nsp", sha)
+                          try:
+                              keys = base64.b64decode(key_b64, validate=True)
+                          except Exception:
+                              raise SafeError("PROD_KEYS_B64 must be single-line base64 of your prod.keys.") from None
+                          require(bool(keys), "Decoded key file is empty.")
+                          key_path = game / "prod.keys"
+                          key_path.write_bytes(keys)
+                          del keys, key_b64, url
+                          ipa = game / "TheGreatAceAttorneyChronicles.ipa"
+                          print("Building unsigned IPA; private details go to encrypted diagnostics...", flush=True)
+                          run([py, str(source / "scripts/build_ipa_from_nsp.py"), str(game), "-k", str(key_path),
+                               "--package", "v0", "--platform", "ios", "--romfs", "bundle", "--gpu", "none",
+                               "--progress", "lines", "-o", str(ipa)], log, env, source)
+                          # Do not release an IPA made from an unintended game or guessed profile.
+                          require((game / f"{TITLE}_build").is_dir(), "Expected game build directory was not produced.")
+                          log.flush()
+                          report = log_path.read_text(errors="replace")
+                          require("provisional game profile" not in report and "was not brought up on" not in report,
+                                  "Unregistered game/build detected; IPA withheld.")
+                          require(ipa.is_file() and ipa.stat().st_size > 0, "No IPA was produced.")
+                          print("Encrypting IPA for your public age recipient...", flush=True)
+                          run(["age", "-r", recipient, "-o", str(artifacts / (ipa.name + ".age")), str(ipa)], log, env)
+                  finally:
+                      # No plaintext game files, extracted files, keys or logs are artifacts.
+                      # Context cleanup removes this entire private temporary tree on normal exit.
+                      if ready_age:
+                          result = subprocess.run(["age", "-r", recipient, "-o", str(artifacts / "diagnostics.log.age"), str(log_path)],
+                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                          require(result.returncode == 0, "Could not encrypt diagnostics.")
+              print("Done. Only encrypted files are available in build artifacts.", flush=True)
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except SafeError as error:
+                  print(str(error), file=sys.stderr)
+                  sys.exit(1)
+              except Exception:
+                  # Avoid URL-bearing HTTP exceptions, subprocess arguments or secret values.
+                  print("Build stopped. Check configuration or encrypted diagnostics.", file=sys.stderr)
+                  sys.exit(1)
+          PRIVATE_BUILD_PY
+    artifacts:
+      - private-artifacts/*.age
