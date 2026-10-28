@@ -1,0 +1,32 @@
+workflows:
+  nxnative-check:
+    name: Verify nxnative Build Environment
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+
+    environment:
+      xcode: 27.1
+
+    scripts:
+      - name: Verify build tools
+        script: |
+          set -eu
+          echo "Checking Apple Silicon..."
+          uname -m
+
+          echo "Checking macOS..."
+          sw_vers
+
+          echo "Checking Xcode..."
+          xcodebuild -version
+
+          echo "Checking Python..."
+          python3 --version
+
+          echo "Checking Homebrew..."
+          brew --version
+
+          echo "Checking nxnative..."
+          test -f scripts/build_ipa_from_nsp.py
+
+          echo "Environment check completed!"
