@@ -56,6 +56,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Reader:** `shader_split.py` scans each archive entry as a file of its own (`bea_members`).
 - **Found on:** [Big Brain Academy: Brain vs. Brain](../../dm/games/0100620012D6E000/README.md) (NintendoWare Bezel Engine 1.56): 2,125 shaders in about 90 s.
 
+### Bezel Engine 2.9 archives keep their entries inline
+
+- **Symptom:** the split finds almost no shaders and reports `[RED] /Archive/<name>.bea: entry 0 @0x4854535341 is not an ASST entry (its shaders are left out)` for every archive (`… file(s) could not be read`); the "offset" is the bytes `ASSTH`.
+- **Cause:** the 1.56 form (version 0x10100 at +8) has at +0x28 the offset of an array of entry offsets; the 2.9 form (version 0x60000) has the entries themselves there, back to back, each 0x48 bytes (its size the u32 at `ASST` +4), with an 8-byte type tag (`_G3DSHA`, `_TEXDATA`, …) at +0x1c and a 16-byte hash before the data and name offsets, which are the last two u64 of an entry in both forms.
+- **Fix:** `bea_members` reads the entries in place when the array starts with `ASST`.
+- **Found on:** [Super Mario Party Jamboree](../../dm/games/0100965017338000/README.md) (Bezel Engine 2.9, 949 archives, 127,203 entries): 25,693 shaders, against 246 (those in `main`) before, most of them in the 13,839 `.fshb` (`_G3DSHA`) entries; the split takes about 10 minutes.
+
 ### BNSH entries of GFPAK archives
 
 - **Symptom:** a provisional split finds only a fraction of the shaders (3,126 of Pokémon Sword's 41,516).
@@ -659,6 +666,8 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ## Bindings and handles
 
+- **Note:** the layout of NVN's driver segments `c0` and `c2` (the handle tables, the storage and uniform buffer tables, the words the host fills) and the binding kinds of the reflection JSON have one definition, `dm/gfx/nvn/dmsh_abi.h`. The host includes it (`nvn_mtl.m`, `nvn_refl.m`, `nvn_obj.h`); `dmsh_build.py` reads it through `dm/gfx/tools/dmsh_abi.py`, which stops on any line it cannot read. Both files are part of the chain version. `dm/tools/tests/test_dmsh_abi.py` checks that the tables fit together, that the host converts every kind the build may write, that the translator's own copy of the `c2` layout (`Program.cs`) agrees, and that the values do not come back as literals in the host or the build. The entries below cite the offsets.
+
 ### Driver-segment reads outside fragment shaders
 
 - **Symptom:** a vertex or compute shader reads zeros from NVN's driver segment `c0`.
@@ -704,6 +713,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** `encode_args` writes the draw's base instance there for graphics stages and does not reuse a stage's argument block across draws with different base instances. The word before it, `0x640`, is added to the vertex ID by 58 of Z-A's shaders and stays 0 until what the driver puts there is known.
 - **Found on:** [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md): from the first step on, the player's legs stuck straight out behind her at hip height, and the rival's forward in a later cutscene; standing still beforehand looked right. The bone palette the game computes on the CPU was already bent. The cause was six occlusion queries a frame, one 36-vertex box each (`a793f436dcabd350`, base instance 61, 62, …), drawn against mip level 2 of the depth pyramid: every box was box 0, every query came back with 0 samples, and the game took its characters for hidden and posed their legs that way. Forcing every result to visible fixed the legs, and depth testing with ALWAYS did not. 793 of the game's vertex shaders read the word.
 - **Note:** how it was found: the raycasts were logged with scratch observation gates (all correct), then `DM_HLECOUNT` showed nothing walking-specific, then the counter reports.
+
+### The base instance of indirect draws comes from Metal
+
+- **Symptom:** flat grey or background-coloured triangles with straight edges across part of the scene, changing shape from frame to frame while the camera stands still; dropping the colour pass's fragment shaders in groups (`DM_NVN_SKIP_FS`) did not remove them, as the instances are misplaced in the depth pre-pass too, whose depth the colour pass tests for equality.
+- **Cause:** for an indirect draw (`DrawElementsIndirect` / `DrawArraysIndirect`) the base instance is in the argument record, which the game's GPU culling writes earlier in the same submission; `encode_args` could only write the command's base instance into `c0 + 0x644`, 0 for an indirect draw. A vertex shader whose instance is (instance index − base instance) + `c0[0x644]` then read its transforms from the first records for every indirect draw.
+- **Fix:** the translation reads the word from Metal's `[[base_instance]]`, which holds every draw's base instance, direct, indirect or masked (`dmsh_build.py` `vs_base_instance`: in vertex functions `c0[100].y` becomes the base instance's bits, and `main0` gets the parameter when it lacks it). `encode_args` still writes the word for the other stages.
+- **Found on:** [Super Mario Party Jamboree](../../dm/games/0100965017338000/README.md): every board. Its culling (`2b5485a2a731a231`, 62 points with rasterization off) writes 80-byte transforms per visible instance into a 30 KB buffer and counts them, `276504dc5c987ecf` writes nine indirect records from the count, and the instanced draws (`5a805bbb08421b86` in the depth pre-pass, `4b05556737e9535f` and `eaa3a44ba28f0744` in the colour pass) draws them, both reading record = instance + `c0[0x644]`. 5,249 of its vertex shaders read the word.
 
 ### Texture and sampler pools with overlapping IDs
 
