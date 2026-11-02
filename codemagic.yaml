@@ -34,6 +34,9 @@ workflows:
           """Manual Codemagic build. No keys, input URLs, or raw build logs on stdout."""
           import base64
           import hashlib
+          import http.client
+          import socket
+          import ssl
           import os
           from pathlib import Path
           import re
@@ -41,6 +44,7 @@ workflows:
           import subprocess
           import sys
           import tempfile
+          import urllib.error
           import urllib.parse
           import urllib.request
 
@@ -75,8 +79,31 @@ workflows:
                       while block := src.read(8 * 1024 * 1024):
                           digest.update(block)
                           dst.write(block)
+              except SafeError:
+                  raise
+              except urllib.error.HTTPError as error:
+                  raise SafeError(f"Private download rejected: HTTP {error.code}. Check proxy access and the saved URL.") from None
+              except (TimeoutError, socket.timeout):
+                  raise SafeError("Private download timed out (120 seconds without data). Check NAS upload and proxy connectivity.") from None
+              except urllib.error.URLError as error:
+                  reason = error.reason
+                  if isinstance(reason, ssl.SSLCertVerificationError):
+                      message = "Private download TLS certificate verification failed. Check the domain certificate and chain."
+                  elif isinstance(reason, socket.gaierror):
+                      message = "Private download DNS lookup failed. Check the download domain DNS records."
+                  elif isinstance(reason, (TimeoutError, socket.timeout)):
+                      message = "Private download connection timed out. Check firewall and proxy connectivity."
+                  else:
+                      message = "Private download connection failed. Check DNS, TLS, firewall and proxy connectivity."
+                  raise SafeError(message) from None
+              except http.client.IncompleteRead:
+                  raise SafeError("Private download was interrupted before completion. Check NAS and proxy stability.") from None
+              except OSError as error:
+                  if error.errno == 28:
+                      raise SafeError("Private download ran out of disk space.") from None
+                  raise SafeError("Private download encountered a network or file write error.") from None
               except Exception:
-                  raise SafeError("Private download failed; check its expiry and access permissions.") from None
+                  raise SafeError("Private download failed unexpectedly; the URL and exception details were withheld.") from None
               require(digest.hexdigest() == expected.lower(), "Game checksum mismatch; build stopped.")
 
 
