@@ -75,7 +75,8 @@ workflows:
               require(re.fullmatch(r"[0-9a-fA-F]{64}", expected), "GAME_SHA256 must be a SHA-256 digest.")
               digest = hashlib.sha256()
               try:
-                  with urllib.request.build_opener(HTTPSOnly()).open(url, timeout=120) as src, target.open("wb") as dst:
+                  request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.build_opener(HTTPSOnly()).open(request, timeout=120) as src, target.open("wb") as dst:
                       while block := src.read(8 * 1024 * 1024):
                           digest.update(block)
                           dst.write(block)
