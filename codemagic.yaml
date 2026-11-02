@@ -4,7 +4,7 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 30
     environment:
-      xcode: 27.1
+      xcode: "27.2"
     scripts:
       - name: Verify build tools
         script: |
@@ -21,7 +21,7 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 120
     environment:
-      xcode: 27.1
+      xcode: "27.2"
       groups:
         - nxnative_private
     # Manual launch only. Do not add webhook, PR, scheduled or tag triggers.
@@ -44,7 +44,7 @@ workflows:
           import urllib.parse
           import urllib.request
 
-          REV = "2f1a0442249acb4b89da9efc9edc27b4ac617348"
+          REV = "0a759de7864b8c22bc0d9f596bb6b9a6f1c45486"
           TITLE = "010036E00FB20000"
           SECRET_NAMES = ("GAME_URL", "GAME_SHA256", "PROD_KEYS_B64")
 
@@ -134,7 +134,7 @@ workflows:
                           run([sys.executable, "-m", "venv", str(root / "venv")], log, env)
                           py = str(root / "venv/bin/python")
                           env["PATH"] = str(root / "venv/bin") + os.pathsep + env["PATH"]
-                          run([py, "-m", "pip", "install", "lz4", "capstone", "fonttools", "nsz", "backports.zstd; python_version < '3.14'"], log, env)
+                          run([py, "-m", "pip", "install", "lz4", "capstone>=5,<6", "fonttools", "nsz", "zbic", "backports.zstd; python_version < '3.14'"], log, env)
                           run([py, str(source / "dm/gfx/tools/own_compilers.py"), "--check-metal"], log, env, source)
                           require(shutil.disk_usage(root).free > 30 * 1024**3, "At least 30 GiB free disk is required for this workflow.")
                           print("Downloading private base NSP and checking its checksum...", flush=True)
