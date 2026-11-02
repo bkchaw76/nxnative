@@ -77,9 +77,22 @@ workflows:
               try:
                   request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                   with urllib.request.build_opener(HTTPSOnly()).open(request, timeout=120) as src, target.open("wb") as dst:
+                      length = src.headers.get("Content-Length", "")
+                      expected_bytes = int(length) if length.isdigit() else None
+                      content_type = src.headers.get_content_type()
+                      # Print only an allowlisted classification, never raw response headers.
+                      kind = "HTML" if content_type == "text/html" else "JSON" if content_type == "application/json" else "other"
+                      print(f"Download response: HTTP {src.status}; type {kind}; expected bytes {expected_bytes}.", flush=True)
+                      received = 0
                       while block := src.read(8 * 1024 * 1024):
                           digest.update(block)
                           dst.write(block)
+                          received += len(block)
+                      print(f"Download received: {received} bytes.", flush=True)
+                      require(expected_bytes is None or received == expected_bytes,
+                              "Private download ended early: received byte count differs from Content-Length.")
+                      require(kind not in ("HTML", "JSON"),
+                              "Private download returned a web page or JSON instead of an NSP.")
               except SafeError:
                   raise
               except urllib.error.HTTPError as error:
