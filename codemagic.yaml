@@ -225,3 +225,221 @@ workflows:
           PRIVATE_BUILD_PY
     artifacts:
       - private-artifacts/*.age
+
+  mario-wonder:
+    name: Super Mario Bros. Wonder 1.2.1 - private unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: "27.2"
+      groups:
+        - nxnative_private
+        - mario_private
+    # Manual launch only. Do not add webhook, PR, scheduled or tag triggers.
+    scripts:
+      - name: Build and encrypt private output
+        script: |
+          set +x
+          set -eu
+          python3 - <<'PRIVATE_BUILD_PY'
+          """Manual Codemagic build. No keys, input URLs, or raw build logs on stdout."""
+          import base64
+          import hashlib
+          import http.client
+          import socket
+          import ssl
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          REV = "0a759de7864b8c22bc0d9f596bb6b9a6f1c45486"
+          TITLE = "010015100B514000"
+          BASE_SHA = "f6fa20f3ded8d6890fb8e02544f5f155b738179ebcd46cb5badc7ffdbfc15b4f"
+          UPDATE_SHA = "f195eaae2b7b48bb9dfe2101d2a9a62142e1fc9642f23a58779c6efddcf51608"
+          SECRET_NAMES = ("MARIO_GAME_URL", "MARIO_UPDATE_URL", "PROD_KEYS_B64")
+
+
+          class SafeError(Exception):
+              pass
+
+
+          def require(condition, message):
+              if not condition:
+                  raise SafeError(message)
+
+
+          class HTTPSOnly(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  require(urllib.parse.urlsplit(newurl).scheme == "https", "Non-HTTPS redirect rejected.")
+                  return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+          def download(url, target, expected):
+              parts = urllib.parse.urlsplit(url)
+              require(parts.scheme == "https" and parts.hostname and not parts.username,
+                      "Download URL must be HTTPS without a username.")
+              require(re.fullmatch(r"[0-9a-fA-F]{64}", expected), "Expected checksum must be a SHA-256 digest.")
+              digest = hashlib.sha256()
+              try:
+                  request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.build_opener(HTTPSOnly()).open(request, timeout=120) as src, target.open("wb") as dst:
+                      length = src.headers.get("Content-Length", "")
+                      expected_bytes = int(length) if length.isdigit() else None
+                      content_type = src.headers.get_content_type()
+                      # Print only an allowlisted classification, never raw response headers.
+                      kind = "HTML" if content_type == "text/html" else "JSON" if content_type == "application/json" else "other"
+                      print(f"Download response: HTTP {src.status}; type {kind}; expected bytes {expected_bytes}.", flush=True)
+                      received = 0
+                      while block := src.read(8 * 1024 * 1024):
+                          digest.update(block)
+                          dst.write(block)
+                          received += len(block)
+                      print(f"Download received: {received} bytes.", flush=True)
+                      require(expected_bytes is None or received == expected_bytes,
+                              "Private download ended early: received byte count differs from Content-Length.")
+                      require(kind not in ("HTML", "JSON"),
+                              "Private download returned a web page or JSON instead of an NSP.")
+              except SafeError:
+                  raise
+              except urllib.error.HTTPError as error:
+                  raise SafeError(f"Private download rejected: HTTP {error.code}. Check proxy access and the saved URL.") from None
+              except (TimeoutError, socket.timeout):
+                  raise SafeError("Private download timed out (120 seconds without data). Check NAS upload and proxy connectivity.") from None
+              except urllib.error.URLError as error:
+                  reason = error.reason
+                  if isinstance(reason, ssl.SSLCertVerificationError):
+                      message = "Private download TLS certificate verification failed. Check the domain certificate and chain."
+                  elif isinstance(reason, socket.gaierror):
+                      message = "Private download DNS lookup failed. Check the download domain DNS records."
+                  elif isinstance(reason, (TimeoutError, socket.timeout)):
+                      message = "Private download connection timed out. Check firewall and proxy connectivity."
+                  else:
+                      message = "Private download connection failed. Check DNS, TLS, firewall and proxy connectivity."
+                  raise SafeError(message) from None
+              except http.client.IncompleteRead:
+                  raise SafeError("Private download was interrupted before completion. Check NAS and proxy stability.") from None
+              except OSError as error:
+                  if error.errno == 28:
+                      raise SafeError("Private download ran out of disk space.") from None
+                  raise SafeError("Private download encountered a network or file write error.") from None
+              except Exception:
+                  raise SafeError("Private download failed unexpectedly; the URL and exception details were withheld.") from None
+              require(digest.hexdigest() == expected.lower(), "Game checksum mismatch; build stopped.")
+
+
+          def run(cmd, log, env, cwd=None):
+              result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=cwd)
+              require(result.returncode == 0, "A build step failed; inspect encrypted diagnostics.")
+
+
+          def main():
+              os.umask(0o077)
+              require(sys.platform == "darwin" and os.uname().machine == "arm64", "Apple Silicon macOS is required.")
+              require(os.environ.get("CM_BRANCH") == "main", "Launch the reviewed main branch only.")
+              require(os.environ.get("CM_PULL_REQUEST", "").lower() in ("", "false", "0"), "Pull request builds are disabled.")
+              for name in SECRET_NAMES + ("IPA_AGE_RECIPIENT",):
+                  require(bool(os.environ.get(name)), f"Missing Codemagic variable: {name}.")
+              recipient = os.environ["IPA_AGE_RECIPIENT"].strip()
+              require(re.fullmatch(r"age1[0-9a-z]+", recipient), "Use an age public recipient (age1...).")
+              url, update_url, key_b64 = (os.environ.pop(name) for name in SECRET_NAMES)
+              # Exclude the other workflow\'s input secrets from build subprocesses.
+              os.environ.pop("GAME_URL", None)
+              os.environ.pop("GAME_SHA256", None)
+              env = dict(os.environ)
+              env.pop("SPIRV_CROSS", None)  # use the repository's locked compiler
+              env.pop("DOTNET_ROOT", None)
+              artifacts = Path(os.environ["CM_BUILD_DIR"]) / "private-artifacts"
+              # Never mix a previous run's output with a new run.
+              require(not artifacts.exists(), "private-artifacts already exists; use a fresh build machine.")
+              artifacts.mkdir(mode=0o700)
+              with tempfile.TemporaryDirectory(prefix="nxnative-private-") as tmp:
+                  root = Path(tmp)
+                  source, game = root / "source", root / "game"
+                  game.mkdir()
+                  log_path = root / "diagnostics.log"
+                  ready_age = False
+                  try:
+                      with log_path.open("wb") as log:
+                          print("Preparing pinned source and build tools...", flush=True)
+                          source.mkdir()
+                          run(["git", "init", "-q", str(source)], log, env)
+                          run(["git", "fetch", "--depth", "1", "https://github.com/seedds/nxnative.git", REV], log, env, source)
+                          run(["git", "checkout", "--detach", "FETCH_HEAD"], log, env, source)
+                          actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, env=env, text=True).strip()
+                          require(actual == REV, "Source revision mismatch.")
+                          run(["brew", "install", "xcodegen", "zstd", "glslang", "age"], log, env)
+                          ready_age = True
+                          # Validate the public recipient before downloading any private input.
+                          probe = root / "probe"
+                          probe.write_bytes(b"recipient validation")
+                          run(["age", "-r", recipient, "-o", str(root / "probe.age"), str(probe)], log, env)
+                          runtimes = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True, env=env) if shutil.which("dotnet") else None
+                          if not runtimes or "Microsoft.NETCore.App 10." not in runtimes.stdout:
+                              run(["brew", "install", "--cask", "dotnet-sdk"], log, env)
+                          runtimes = subprocess.run(["dotnet", "--list-runtimes"], capture_output=True, text=True, env=env)
+                          require(runtimes.returncode == 0 and "Microsoft.NETCore.App 10." in runtimes.stdout,
+                                  "The bundled translator requires .NET 10; install its arm64 runtime on the build image.")
+                          run(["xcodebuild", "-downloadComponent", "MetalToolchain"], log, env)
+                          run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], log, env)
+                          run([sys.executable, "-m", "venv", str(root / "venv")], log, env)
+                          py = str(root / "venv/bin/python")
+                          env["PATH"] = str(root / "venv/bin") + os.pathsep + env["PATH"]
+                          run([py, "-m", "pip", "install", "lz4", "capstone>=5,<6", "fonttools", "nsz", "zbic", "backports.zstd; python_version < '3.14'"], log, env)
+                          run([py, str(source / "dm/gfx/tools/own_compilers.py"), "--check-metal"], log, env, source)
+                          require(shutil.disk_usage(root).free > 30 * 1024**3, "At least 30 GiB free disk is required for this workflow.")
+                          print("Downloading private base NSP and checking its checksum...", flush=True)
+                          download(url, game / f"{TITLE}[v0].nsp", BASE_SHA)
+                          print("Downloading private 1.2.1 update NSP and checking its checksum...", flush=True)
+                          download(update_url, game / "010015100B514800[v327680].nsp", UPDATE_SHA)
+                          try:
+                              keys = base64.b64decode(key_b64, validate=True)
+                          except Exception:
+                              raise SafeError("PROD_KEYS_B64 must be single-line base64 of your prod.keys.") from None
+                          require(bool(keys), "Decoded key file is empty.")
+                          key_path = game / "prod.keys"
+                          key_path.write_bytes(keys)
+                          del keys, key_b64, url, update_url
+                          ipa = game / "SuperMarioBrosWonder-1.2.1.ipa"
+                          print("Building unsigned IPA; private details go to encrypted diagnostics...", flush=True)
+                          run([py, str(source / "scripts/build_ipa_from_nsp.py"), str(game), "-k", str(key_path),
+                               "--package", "v327680", "--platform", "ios", "--romfs", "bundle", "--gpu", "none",
+                               "--progress", "lines", "-o", str(ipa)], log, env, source)
+                          # Do not release an IPA made from an unintended game or guessed profile.
+                          require((game / f"{TITLE}_build").is_dir(), "Expected game build directory was not produced.")
+                          log.flush()
+                          report = log_path.read_text(errors="replace")
+                          require("provisional game profile" not in report and "was not brought up on" not in report,
+                                  "Unregistered game/build detected; IPA withheld.")
+                          require(ipa.is_file() and ipa.stat().st_size > 0, "No IPA was produced.")
+                          print("Encrypting IPA for your public age recipient...", flush=True)
+                          run(["age", "-r", recipient, "-o", str(artifacts / (ipa.name + ".age")), str(ipa)], log, env)
+                  finally:
+                      # No plaintext game files, extracted files, keys or logs are artifacts.
+                      # Context cleanup removes this entire private temporary tree on normal exit.
+                      if ready_age:
+                          result = subprocess.run(["age", "-r", recipient, "-o", str(artifacts / "diagnostics.log.age"), str(log_path)],
+                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                          require(result.returncode == 0, "Could not encrypt diagnostics.")
+              print("Done. Only encrypted files are available in build artifacts.", flush=True)
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except SafeError as error:
+                  print(str(error), file=sys.stderr)
+                  sys.exit(1)
+              except Exception:
+                  # Avoid URL-bearing HTTP exceptions, subprocess arguments or secret values.
+                  print("Build stopped. Check configuration or encrypted diagnostics.", file=sys.stderr)
+                  sys.exit(1)
+          PRIVATE_BUILD_PY
+    artifacts:
+      - private-artifacts/*.age
